@@ -2,14 +2,9 @@ import streamlit as st
 import pandas as pd
 import re
 from datetime import datetime
-import time
-import cv2
-import numpy as np
-from pyzbar import pyzbar
-from PIL import Image
-import streamlit_camera_input_live
+import json
 
-# Configuration de la page pour mobile
+# Configuration page mobile
 st.set_page_config(
     page_title="Déménagement Logistique",
     page_icon="📦",
@@ -20,40 +15,41 @@ st.set_page_config(
 # CSS pour mobile
 st.markdown("""
     <style>
-    .stApp { max-width: 100%; padding: 0; }
-    .stButton > button {
-        width: 100%;
-        height: 60px;
-        font-size: 18px !important;
+    .stApp { padding: 10px; }
+    .big-font { font-size: 24px !important; font-weight: bold; }
+    .success-box { 
+        padding: 20px; 
+        background-color: #d4edda; 
+        border-radius: 10px; 
         margin: 10px 0;
     }
-    .status-card {
-        padding: 20px;
-        border-radius: 10px;
+    .error-box { 
+        padding: 20px; 
+        background-color: #f8d7da; 
+        border-radius: 10px; 
+        margin: 10px 0;
+    }
+    .direction-box { 
+        padding: 20px; 
+        background-color: #fff3cd; 
+        border-radius: 10px; 
         margin: 10px 0;
         text-align: center;
         font-size: 20px;
+        font-weight: bold;
     }
-    .success { background-color: #4CAF50; color: white; }
-    .error { background-color: #f44336; color: white; }
-    .waiting { background-color: #2196F3; color: white; }
-    .direction { background-color: #FF9800; color: white; }
     </style>
     """, unsafe_allow_html=True)
 
-# Initialisation session state
-if 'state' not in st.session_state:
-    st.session_state.state = 'WAITING_OLD'
+# Session state
+if 'scan_state' not in st.session_state:
+    st.session_state.scan_state = 'WAITING_OLD'
     st.session_state.old_location = None
     st.session_state.new_location = None
     st.session_state.quantity = None
     st.session_state.processed = 0
-    st.session_state.history = []
-    st.session_state.camera_active = False
-    st.session_state.last_detected = None
-    st.session_state.detection_count = 0
 
-# Charger le CSV
+# Charger CSV
 @st.cache_data
 def load_csv():
     try:
@@ -61,201 +57,193 @@ def load_csv():
         if len(df.columns) >= 3:
             df = df.iloc[:, :3]
             df.columns = ['ancien', 'quantite', 'nouveau']
-        df['ancien'] = df['ancien'].astype(str).str.strip()
-        df['nouveau'] = df['nouveau'].astype(str).str.strip()
-        df['quantite'] = pd.to_numeric(df['quantite'], errors='coerce').fillna(0).astype(int)
-        df = df[df['ancien'] != '1']
-        df = df[df['ancien'].str.len() > 0]
-        return df
+            df['ancien'] = df['ancien'].astype(str).str.strip()
+            df['nouveau'] = df['nouveau'].astype(str).str.strip()
+            df['quantite'] = pd.to_numeric(df['quantite'], errors='coerce').fillna(0).astype(int)
+            df = df[df['ancien'] != '1']
+            return df
     except:
+        # Données de test
         return pd.DataFrame({
             'ancien': ['TEST001', 'TEST002'],
             'quantite': [10, 25],
             'nouveau': ['A-01-01', 'A-01-02']
         })
 
-# Détecter code-barres dans l'image
-def detect_barcode(image):
-    try:
-        # Convertir PIL en numpy array
-        img_array = np.array(image)
-        
-        # Essayer la détection directe
-        barcodes = pyzbar.decode(img_array)
-        
-        if not barcodes and len(img_array.shape) == 3:
-            # Convertir en niveaux de gris
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-            
-            # Améliorer le contraste
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(gray)
-            
-            # Réessayer
-            barcodes = pyzbar.decode(enhanced)
-            
-            if not barcodes:
-                # Essayer avec flou pour réduire le bruit
-                blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-                barcodes = pyzbar.decode(blurred)
-        
-        if barcodes:
-            return barcodes[0].data.decode('utf-8')
-        return None
-        
-    except Exception as e:
-        return None
-
-# Nettoyer les codes
+# Nettoyer codes
 def clean_code(code):
-    if code and not any(x in str(code).upper() for x in ['POUMON', 'DELTA', 'DEMENAGEMENT']):
-        pattern = r'^([A-Z])\1(-\d)'
-        if re.match(pattern, str(code)):
-            return re.sub(pattern, r'\1\2', str(code))
-    return str(code)
+    if not code:
+        return ''
+    code = str(code).strip().upper()
+    if any(x in code for x in ['POUMON', 'DELTA', 'DEMENAGEMENT']):
+        return code
+    pattern = r'^([A-Z])\1(-\d)'
+    if re.match(pattern, code):
+        return re.sub(pattern, r'\1\2', code)
+    return code
 
-# Traiter le code détecté
-def process_scan(code, df):
-    scan_clean = clean_code(code.strip().upper())
-    
-    if st.session_state.state == 'WAITING_OLD':
-        df['ancien_upper'] = df['ancien'].str.upper()
-        match = df[df['ancien_upper'] == scan_clean]
-        
-        if not match.empty:
-            st.session_state.old_location = scan_clean
-            st.session_state.new_location = match.iloc[0]['nouveau']
-            st.session_state.quantity = match.iloc[0]['quantite']
-            st.session_state.state = 'WAITING_NEW'
-            return f"✅ Trouvé! Direction: {st.session_state.new_location}"
-        else:
-            return f"❌ Code non trouvé: {scan_clean}"
-    
-    elif st.session_state.state == 'WAITING_NEW':
-        new_clean = clean_code(st.session_state.new_location.strip().upper())
-        
-        if scan_clean == new_clean:
-            st.session_state.processed += 1
-            st.session_state.history.append({
-                'ancien': st.session_state.old_location,
-                'nouveau': st.session_state.new_location,
-                'quantite': st.session_state.quantity,
-                'heure': datetime.now().strftime("%H:%M")
-            })
+# Interface HTML pour scanner natif
+def barcode_scanner_component():
+    scanner_html = """
+    <div style="margin: 20px 0;">
+        <input 
+            type="text" 
+            id="barcodeInput" 
+            placeholder="Scanner ou taper le code..."
+            style="
+                width: 100%;
+                padding: 15px;
+                font-size: 20px;
+                border: 2px solid #4CAF50;
+                border-radius: 10px;
+                text-align: center;
+            "
+            autofocus
+            autocomplete="off"
+            inputmode="none"
+        />
+        <script>
+            // Focus automatique
+            document.getElementById('barcodeInput').focus();
             
-            st.session_state.state = 'WAITING_OLD'
-            st.session_state.old_location = None
-            st.session_state.new_location = None
-            st.session_state.quantity = None
-            return f"✅ SUCCÈS! {st.session_state.quantity} pièces déplacées"
-        else:
-            return f"❌ Mauvais emplacement! Attendu: {st.session_state.new_location}"
+            // Capturer les scans
+            document.getElementById('barcodeInput').addEventListener('input', function(e) {
+                const value = e.target.value;
+                // Les scanners ajoutent souvent un retour chariot
+                if (value.includes('\\n') || value.includes('\\r') || value.length > 5) {
+                    // Envoyer à Streamlit
+                    const cleanValue = value.replace(/[\\n\\r]/g, '');
+                    window.parent.postMessage({
+                        type: 'BARCODE_SCAN',
+                        code: cleanValue
+                    }, '*');
+                    // Clear input
+                    setTimeout(() => {
+                        e.target.value = '';
+                    }, 100);
+                }
+            });
+            
+            // Enter key
+            document.getElementById('barcodeInput').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter' && e.target.value) {
+                    window.parent.postMessage({
+                        type: 'BARCODE_SCAN',
+                        code: e.target.value
+                    }, '*');
+                    e.target.value = '';
+                }
+            });
+        </script>
+    </div>
+    """
+    return scanner_html
 
-# Charger les données
+# Charger données
 df = load_csv()
 
 # Header
-st.markdown("<h1 style='text-align: center; color: #2196F3;'>📦 DÉMÉNAGEMENT LOGISTIQUE</h1>", unsafe_allow_html=True)
+st.markdown("# 📦 Déménagement Logistique")
 
-# Statistiques
+# Stats
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("Total", f"{len(df)}")
+    st.metric("Total", len(df))
 with col2:
-    st.metric("Traités", f"{st.session_state.processed}")
+    st.metric("Traités", st.session_state.processed)
 with col3:
-    pourcentage = (st.session_state.processed / len(df) * 100) if len(df) > 0 else 0
-    st.metric("Progression", f"{pourcentage:.1f}%")
+    pct = (st.session_state.processed / len(df) * 100) if len(df) > 0 else 0
+    st.metric("Progression", f"{pct:.0f}%")
 
-# Zone de statut
-if st.session_state.state == 'WAITING_OLD':
-    st.markdown("""
-        <div class='status-card waiting'>
-            📦 EN ATTENTE<br>
-            <small>Scannez l'ancien emplacement</small>
-        </div>
-    """, unsafe_allow_html=True)
-elif st.session_state.state == 'WAITING_NEW':
+# État actuel
+if st.session_state.scan_state == 'WAITING_OLD':
+    st.info("🔍 **Scannez l'ANCIEN emplacement**")
+elif st.session_state.scan_state == 'WAITING_NEW':
     st.markdown(f"""
-        <div class='status-card direction'>
-            ➡️ DIRECTION<br>
-            <strong style='font-size: 24px;'>{st.session_state.new_location}</strong><br>
-            <small>Quantité: {st.session_state.quantity} pièces</small>
-        </div>
+    <div class="direction-box">
+        ➡️ ALLEZ À<br>
+        <span style="font-size: 30px;">{st.session_state.new_location}</span><br>
+        Quantité: {st.session_state.quantity} pièces
+    </div>
     """, unsafe_allow_html=True)
+    st.warning("🎯 **Scannez le NOUVEAU emplacement pour confirmer**")
 
-st.markdown("---")
+# Scanner natif ou input
+st.markdown("### Scanner")
 
-# Zone de scan
-tab1, tab2 = st.tabs(["📷 Scanner", "⌨️ Manuel"])
+# Component HTML pour scanner
+st.components.v1.html(barcode_scanner_component(), height=100)
 
-with tab1:
-    col1, col2 = st.columns(2)
+# Alternative : Input manuel
+with st.form("manual_input", clear_on_submit=True):
+    col1, col2 = st.columns([3, 1])
     with col1:
-        if st.button("🎯 ACTIVER CAMÉRA", type="primary", use_container_width=True):
-            st.session_state.camera_active = True
+        code_input = st.text_input("Ou tapez le code manuellement", label_visibility="collapsed", placeholder="Ex: A-01-01-1")
     with col2:
-        if st.button("⏹️ ARRÊTER", type="secondary", use_container_width=True):
-            st.session_state.camera_active = False
-            st.rerun()
+        submit = st.form_submit_button("✅ Valider", use_container_width=True, type="primary")
     
-    if st.session_state.camera_active:
-        # Scanner en continu
-        image = streamlit_camera_input_live.camera_input_live(
-            key="camera_scanner",
-            height=400,
-            debounce=500  # Capture toutes les 500ms
-        )
+    if submit and code_input:
+        cleaned = clean_code(code_input)
         
-        if image is not None:
-            # Détecter le code-barres
-            detected_code = detect_barcode(image)
-            
-            if detected_code:
-                # Éviter les détections multiples du même code
-                if detected_code != st.session_state.last_detected:
-                    st.session_state.last_detected = detected_code
-                    st.session_state.detection_count = 0
-                    
-                    # Traiter le scan
-                    result = process_scan(detected_code, df)
-                    st.info(result)
-                    
-                    if "SUCCÈS" in result or "Direction" in result:
-                        time.sleep(2)
-                        st.rerun()
-                else:
-                    st.session_state.detection_count += 1
-                    if st.session_state.detection_count > 5:
-                        st.session_state.last_detected = None
+        if st.session_state.scan_state == 'WAITING_OLD':
+            # Chercher ancien
+            match = df[df['ancien'].str.upper() == cleaned]
+            if not match.empty:
+                st.session_state.old_location = cleaned
+                st.session_state.new_location = match.iloc[0]['nouveau']
+                st.session_state.quantity = match.iloc[0]['quantite']
+                st.session_state.scan_state = 'WAITING_NEW'
+                st.rerun()
             else:
-                st.info("📷 Pointez vers le code-barres...")
+                st.error(f"❌ Code non trouvé : {cleaned}")
+        
+        elif st.session_state.scan_state == 'WAITING_NEW':
+            # Vérifier nouveau
+            expected = clean_code(st.session_state.new_location)
+            if cleaned == expected:
+                st.session_state.processed += 1
+                st.success(f"✅ **SUCCÈS!** {st.session_state.quantity} pièces déplacées")
+                st.balloons()
+                # Reset
+                st.session_state.scan_state = 'WAITING_OLD'
+                st.session_state.old_location = None
+                st.session_state.new_location = None
+                st.session_state.quantity = None
+                st.rerun()
+            else:
+                st.error(f"❌ Mauvais emplacement! Attendu: {st.session_state.new_location}")
 
-with tab2:
-    manual_input = st.text_input("Code-barres", placeholder="Ex: A-01-01-1")
-    
-    if st.button("✅ VALIDER", type="primary", use_container_width=True):
-        if manual_input:
-            result = process_scan(manual_input, df)
-            st.info(result)
-            time.sleep(2)
-            st.rerun()
-
-# Info actuelle
+# Infos actuelles
 if st.session_state.old_location:
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
-        st.info(f"📍 De: **{st.session_state.old_location}**")
+        st.info(f"📍 **Ancien:** {st.session_state.old_location}")
     with col2:
-        st.info(f"📦 Vers: **{st.session_state.new_location}**")
+        st.info(f"📦 **Nouveau:** {st.session_state.new_location}")
 
-# Bouton Reset
+# Reset
 st.markdown("---")
 if st.button("🔄 RESET", use_container_width=True):
-    st.session_state.state = 'WAITING_OLD'
+    st.session_state.scan_state = 'WAITING_OLD'
     st.session_state.old_location = None
     st.session_state.new_location = None
     st.session_state.quantity = None
-    st.session_state.camera_active = False
     st.rerun()
+
+# Script pour recevoir messages du scanner HTML
+st.components.v1.html("""
+<script>
+window.addEventListener('message', function(e) {
+    if (e.data.type === 'BARCODE_SCAN') {
+        // Simuler un submit du formulaire avec le code scanné
+        const input = window.parent.document.querySelector('input[type="text"]');
+        const button = window.parent.document.querySelector('button[type="submit"]');
+        if (input && button) {
+            input.value = e.data.code;
+            button.click();
+        }
+    }
+});
+</script>
+""", height=0)
