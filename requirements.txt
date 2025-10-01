@@ -1,6 +1,2 @@
 streamlit
 pandas
-opencv-python-headless
-pyzbar
-pillow
-numpy
