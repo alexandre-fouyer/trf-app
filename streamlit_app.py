@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
 import re
-from datetime import datetime
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import av
 import cv2
 import numpy as np
 from pyzbar import pyzbar
-from PIL import Image
+import time
 
 # Configuration page mobile
 st.set_page_config(
@@ -15,21 +16,19 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# CSS pour mobile
+# CSS
 st.markdown("""
     <style>
     .stApp { padding: 10px; }
     .direction-box { 
         padding: 20px; 
-        background-color: #fff3cd; 
-        border-radius: 10px; 
-        margin: 10px 0;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border-radius: 15px; 
         text-align: center;
-        font-size: 20px;
+        font-size: 24px;
         font-weight: bold;
-    }
-    div[data-testid="stCameraInput"] {
-        margin: 10px 0;
+        margin: 20px 0;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -41,7 +40,8 @@ if 'scan_state' not in st.session_state:
     st.session_state.new_location = None
     st.session_state.quantity = None
     st.session_state.processed = 0
-    st.session_state.last_processed_code = None
+    st.session_state.last_code = None
+    st.session_state.code_detected = False
 
 # Charger CSV
 @st.cache_data
@@ -58,76 +58,60 @@ def load_csv():
             return df
     except:
         return pd.DataFrame({
-            'ancien': ['TEST001', 'TEST002'],
-            'quantite': [10, 25],
-            'nouveau': ['A-01-01', 'A-01-02']
+            'ancien': ['L-10-06-5', 'TEST001', 'TEST002'],
+            'quantite': [10, 25, 5],
+            'nouveau': ['A-01-01', 'A-01-02', 'B-01-01']
         })
 
-# Détecter code-barres dans image
-def detect_barcode(image):
-    try:
-        img_array = np.array(image)
+# Processeur vidéo pour detection en temps réel
+class BarcodeScanner(VideoProcessorBase):
+    def __init__(self):
+        self.last_detected = None
+        self.detection_time = 0
         
-        # Essayer détection directe
-        barcodes = pyzbar.decode(img_array)
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
         
-        if not barcodes and len(img_array.shape) == 3:
-            # Convertir en gris et améliorer
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        # Détecter les codes-barres
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        barcodes = pyzbar.decode(gray)
+        
+        for barcode in barcodes:
+            # Décoder
+            barcode_data = barcode.data.decode('utf-8')
             
-            # Améliorer contraste
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(gray)
+            # Éviter détections répétées
+            current_time = time.time()
+            if barcode_data != self.last_detected or (current_time - self.detection_time) > 2:
+                self.last_detected = barcode_data
+                self.detection_time = current_time
+                
+                # Sauvegarder dans session state
+                st.session_state.last_code = barcode_data
+                st.session_state.code_detected = True
             
-            barcodes = pyzbar.decode(enhanced)
+            # Dessiner rectangle vert autour du code détecté
+            points = barcode.polygon
+            if len(points) == 4:
+                pts = np.array(points, np.int32)
+                pts = pts.reshape((-1, 1, 2))
+                cv2.polylines(img, [pts], True, (0, 255, 0), 3)
+            
+            # Afficher le code
+            x = barcode.rect[0]
+            y = barcode.rect[1]
+            cv2.putText(img, barcode_data, (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
-        if barcodes:
-            return barcodes[0].data.decode('utf-8')
-        return None
-    except:
-        return None
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# Nettoyer codes
+# Nettoyer codes (pas de double lettre au début)
 def clean_code(code):
     if not code:
         return ''
     code = str(code).strip().upper()
-    if any(x in code for x in ['POUMON', 'DELTA', 'DEMENAGEMENT']):
-        return code
-    pattern = r'^([A-Z])\1(-\d)'
-    if re.match(pattern, code):
-        return re.sub(pattern, r'\1\2', code)
+    # Pour vos codes comme L-10-06-5, pas besoin de nettoyer
     return code
-
-# Traiter un scan
-def process_scan(code, df):
-    cleaned = clean_code(code)
-    
-    if st.session_state.scan_state == 'WAITING_OLD':
-        match = df[df['ancien'].str.upper() == cleaned]
-        if not match.empty:
-            st.session_state.old_location = cleaned
-            st.session_state.new_location = match.iloc[0]['nouveau']
-            st.session_state.quantity = match.iloc[0]['quantite']
-            st.session_state.scan_state = 'WAITING_NEW'
-            st.session_state.last_processed_code = cleaned
-            return True, f"✅ Direction: {st.session_state.new_location}"
-        else:
-            return False, f"❌ Code non trouvé: {cleaned}"
-    
-    elif st.session_state.scan_state == 'WAITING_NEW':
-        expected = clean_code(st.session_state.new_location)
-        if cleaned == expected:
-            st.session_state.processed += 1
-            st.session_state.scan_state = 'WAITING_OLD'
-            qty = st.session_state.quantity
-            st.session_state.old_location = None
-            st.session_state.new_location = None
-            st.session_state.quantity = None
-            st.session_state.last_processed_code = cleaned
-            return True, f"✅ SUCCÈS! {qty} pièces déplacées"
-        else:
-            return False, f"❌ Mauvais emplacement!"
 
 # Charger données
 df = load_csv()
@@ -147,93 +131,85 @@ with col3:
 
 # État actuel
 if st.session_state.scan_state == 'WAITING_OLD':
-    st.info("🔍 **Scannez l'ANCIEN emplacement**")
+    st.info("🔍 **Pointez la caméra vers l'ANCIEN emplacement**")
 elif st.session_state.scan_state == 'WAITING_NEW':
     st.markdown(f"""
     <div class="direction-box">
         ➡️ ALLEZ À<br>
-        <span style="font-size: 30px;">{st.session_state.new_location}</span><br>
-        Quantité: {st.session_state.quantity} pièces
+        <span style="font-size: 36px;">{st.session_state.new_location}</span><br>
+        <span style="font-size: 18px;">Quantité: {st.session_state.quantity} pièces</span>
     </div>
     """, unsafe_allow_html=True)
-    st.warning("🎯 **Scannez le NOUVEAU emplacement pour confirmer**")
+    st.warning("🎯 **Scannez le NOUVEAU emplacement**")
 
-# Tabs pour scanner
-tab1, tab2, tab3 = st.tabs(["📷 Caméra", "⌨️ Manuel", "🔫 Scanner USB"])
+# Scanner en temps réel
+st.markdown("### 📷 Scanner Automatique")
 
-with tab1:
-    st.info("Prenez une photo nette du code-barres")
-    
-    # Camera input
-    camera_photo = st.camera_input("Scanner", key="camera_scanner")
-    
-    if camera_photo is not None:
-        # Détecter le code
-        image = Image.open(camera_photo)
-        code = detect_barcode(image)
-        
-        if code and code != st.session_state.last_processed_code:
-            success, message = process_scan(code, df)
-            if success:
-                st.success(message)
-                st.balloons() if "SUCCÈS" in message else None
-                st.rerun()
-            else:
-                st.error(message)
-        elif not code:
-            st.warning("Aucun code détecté. Réessayez avec une photo plus nette.")
+# Streamer vidéo avec détection
+ctx = webrtc_streamer(
+    key="barcode-scanner",
+    video_processor_factory=BarcodeScanner,
+    rtc_configuration={
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    },
+    media_stream_constraints={
+        "video": {"facingMode": "environment"},  # Caméra arrière
+        "audio": False
+    }
+)
 
-with tab2:
-    # Input manuel
-    with st.form("manual_form", clear_on_submit=True):
-        code_input = st.text_input("Code-barres", placeholder="Ex: A-01-01-1")
-        submit = st.form_submit_button("✅ Valider", use_container_width=True, type="primary")
-        
-        if submit and code_input:
-            success, message = process_scan(code_input, df)
-            if success:
-                st.success(message)
-                st.balloons() if "SUCCÈS" in message else None
-                st.rerun()
-            else:
-                st.error(message)
-
-with tab3:
-    st.info("Pour scanner USB/Bluetooth")
+# Traiter la détection
+if st.session_state.code_detected:
+    code = st.session_state.last_code
+    cleaned = clean_code(code)
     
-    # Input pour scanner qui émule clavier (sans limite de caractères)
-    usb_code = st.text_input(
-        "Le scanner enverra le code ici",
-        placeholder="Attendez le scan...",
-        key="usb_scanner"
-    )
-    
-    if usb_code:
-        success, message = process_scan(usb_code, df)
-        if success:
-            st.success(message)
-            st.balloons() if "SUCCÈS" in message else None
-            # Clear et rerun
-            st.session_state.usb_scanner = ""
+    if st.session_state.scan_state == 'WAITING_OLD':
+        match = df[df['ancien'].str.upper() == cleaned]
+        if not match.empty:
+            st.session_state.old_location = cleaned
+            st.session_state.new_location = match.iloc[0]['nouveau']
+            st.session_state.quantity = match.iloc[0]['quantite']
+            st.session_state.scan_state = 'WAITING_NEW'
+            st.success(f"✅ Trouvé! Direction: {st.session_state.new_location}")
+            st.session_state.code_detected = False
+            time.sleep(1)
             st.rerun()
         else:
-            st.error(message)
+            st.error(f"❌ Code non trouvé: {cleaned}")
+            st.session_state.code_detected = False
+    
+    elif st.session_state.scan_state == 'WAITING_NEW':
+        expected = clean_code(st.session_state.new_location)
+        if cleaned == expected:
+            st.session_state.processed += 1
+            st.balloons()
+            st.success(f"✅ SUCCÈS! {st.session_state.quantity} pièces déplacées")
+            # Reset
+            st.session_state.scan_state = 'WAITING_OLD'
+            st.session_state.old_location = None
+            st.session_state.new_location = None
+            st.session_state.quantity = None
+            st.session_state.code_detected = False
+            time.sleep(2)
+            st.rerun()
+        else:
+            st.error(f"❌ Mauvais emplacement!")
+            st.session_state.code_detected = False
 
-# Infos actuelles
-if st.session_state.old_location:
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.info(f"📍 **Ancien:** {st.session_state.old_location}")
-    with col2:
-        st.info(f"📦 **Nouveau:** {st.session_state.new_location}")
+# Alternative manuelle
+with st.expander("⌨️ Saisie Manuelle"):
+    with st.form("manual", clear_on_submit=True):
+        code = st.text_input("Code", placeholder="L-10-06-5")
+        if st.form_submit_button("Valider", use_container_width=True):
+            st.session_state.last_code = code
+            st.session_state.code_detected = True
+            st.rerun()
 
 # Reset
-st.markdown("---")
 if st.button("🔄 RESET", use_container_width=True):
     st.session_state.scan_state = 'WAITING_OLD'
     st.session_state.old_location = None
     st.session_state.new_location = None
     st.session_state.quantity = None
-    st.session_state.last_processed_code = None
+    st.session_state.code_detected = False
     st.rerun()
