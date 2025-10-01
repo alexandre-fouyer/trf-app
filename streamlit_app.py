@@ -2,7 +2,10 @@ import streamlit as st
 import pandas as pd
 import re
 from datetime import datetime
-import json
+import cv2
+import numpy as np
+from pyzbar import pyzbar
+from PIL import Image
 
 # Configuration page mobile
 st.set_page_config(
@@ -16,19 +19,6 @@ st.set_page_config(
 st.markdown("""
     <style>
     .stApp { padding: 10px; }
-    .big-font { font-size: 24px !important; font-weight: bold; }
-    .success-box { 
-        padding: 20px; 
-        background-color: #d4edda; 
-        border-radius: 10px; 
-        margin: 10px 0;
-    }
-    .error-box { 
-        padding: 20px; 
-        background-color: #f8d7da; 
-        border-radius: 10px; 
-        margin: 10px 0;
-    }
     .direction-box { 
         padding: 20px; 
         background-color: #fff3cd; 
@@ -37,6 +27,9 @@ st.markdown("""
         text-align: center;
         font-size: 20px;
         font-weight: bold;
+    }
+    div[data-testid="stCameraInput"] {
+        margin: 10px 0;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -48,6 +41,7 @@ if 'scan_state' not in st.session_state:
     st.session_state.new_location = None
     st.session_state.quantity = None
     st.session_state.processed = 0
+    st.session_state.last_processed_code = None
 
 # Charger CSV
 @st.cache_data
@@ -63,12 +57,35 @@ def load_csv():
             df = df[df['ancien'] != '1']
             return df
     except:
-        # Données de test
         return pd.DataFrame({
             'ancien': ['TEST001', 'TEST002'],
             'quantite': [10, 25],
             'nouveau': ['A-01-01', 'A-01-02']
         })
+
+# Détecter code-barres dans image
+def detect_barcode(image):
+    try:
+        img_array = np.array(image)
+        
+        # Essayer détection directe
+        barcodes = pyzbar.decode(img_array)
+        
+        if not barcodes and len(img_array.shape) == 3:
+            # Convertir en gris et améliorer
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            
+            # Améliorer contraste
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(gray)
+            
+            barcodes = pyzbar.decode(enhanced)
+        
+        if barcodes:
+            return barcodes[0].data.decode('utf-8')
+        return None
+    except:
+        return None
 
 # Nettoyer codes
 def clean_code(code):
@@ -82,62 +99,35 @@ def clean_code(code):
         return re.sub(pattern, r'\1\2', code)
     return code
 
-# Interface HTML pour scanner natif
-def barcode_scanner_component():
-    scanner_html = """
-    <div style="margin: 20px 0;">
-        <input 
-            type="text" 
-            id="barcodeInput" 
-            placeholder="Scanner ou taper le code..."
-            style="
-                width: 100%;
-                padding: 15px;
-                font-size: 20px;
-                border: 2px solid #4CAF50;
-                border-radius: 10px;
-                text-align: center;
-            "
-            autofocus
-            autocomplete="off"
-            inputmode="none"
-        />
-        <script>
-            // Focus automatique
-            document.getElementById('barcodeInput').focus();
-            
-            // Capturer les scans
-            document.getElementById('barcodeInput').addEventListener('input', function(e) {
-                const value = e.target.value;
-                // Les scanners ajoutent souvent un retour chariot
-                if (value.includes('\\n') || value.includes('\\r') || value.length > 5) {
-                    // Envoyer à Streamlit
-                    const cleanValue = value.replace(/[\\n\\r]/g, '');
-                    window.parent.postMessage({
-                        type: 'BARCODE_SCAN',
-                        code: cleanValue
-                    }, '*');
-                    // Clear input
-                    setTimeout(() => {
-                        e.target.value = '';
-                    }, 100);
-                }
-            });
-            
-            // Enter key
-            document.getElementById('barcodeInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter' && e.target.value) {
-                    window.parent.postMessage({
-                        type: 'BARCODE_SCAN',
-                        code: e.target.value
-                    }, '*');
-                    e.target.value = '';
-                }
-            });
-        </script>
-    </div>
-    """
-    return scanner_html
+# Traiter un scan
+def process_scan(code, df):
+    cleaned = clean_code(code)
+    
+    if st.session_state.scan_state == 'WAITING_OLD':
+        match = df[df['ancien'].str.upper() == cleaned]
+        if not match.empty:
+            st.session_state.old_location = cleaned
+            st.session_state.new_location = match.iloc[0]['nouveau']
+            st.session_state.quantity = match.iloc[0]['quantite']
+            st.session_state.scan_state = 'WAITING_NEW'
+            st.session_state.last_processed_code = cleaned
+            return True, f"✅ Direction: {st.session_state.new_location}"
+        else:
+            return False, f"❌ Code non trouvé: {cleaned}"
+    
+    elif st.session_state.scan_state == 'WAITING_NEW':
+        expected = clean_code(st.session_state.new_location)
+        if cleaned == expected:
+            st.session_state.processed += 1
+            st.session_state.scan_state = 'WAITING_OLD'
+            qty = st.session_state.quantity
+            st.session_state.old_location = None
+            st.session_state.new_location = None
+            st.session_state.quantity = None
+            st.session_state.last_processed_code = cleaned
+            return True, f"✅ SUCCÈS! {qty} pièces déplacées"
+        else:
+            return False, f"❌ Mauvais emplacement!"
 
 # Charger données
 df = load_csv()
@@ -168,50 +158,66 @@ elif st.session_state.scan_state == 'WAITING_NEW':
     """, unsafe_allow_html=True)
     st.warning("🎯 **Scannez le NOUVEAU emplacement pour confirmer**")
 
-# Scanner natif ou input
-st.markdown("### Scanner")
+# Tabs pour scanner
+tab1, tab2, tab3 = st.tabs(["📷 Caméra", "⌨️ Manuel", "🔫 Scanner USB"])
 
-# Component HTML pour scanner
-st.components.v1.html(barcode_scanner_component(), height=100)
-
-# Alternative : Input manuel
-with st.form("manual_input", clear_on_submit=True):
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        code_input = st.text_input("Ou tapez le code manuellement", label_visibility="collapsed", placeholder="Ex: A-01-01-1")
-    with col2:
-        submit = st.form_submit_button("✅ Valider", use_container_width=True, type="primary")
+with tab1:
+    st.info("Prenez une photo nette du code-barres")
     
-    if submit and code_input:
-        cleaned = clean_code(code_input)
+    # Camera input
+    camera_photo = st.camera_input("Scanner", key="camera_scanner")
+    
+    if camera_photo is not None:
+        # Détecter le code
+        image = Image.open(camera_photo)
+        code = detect_barcode(image)
         
-        if st.session_state.scan_state == 'WAITING_OLD':
-            # Chercher ancien
-            match = df[df['ancien'].str.upper() == cleaned]
-            if not match.empty:
-                st.session_state.old_location = cleaned
-                st.session_state.new_location = match.iloc[0]['nouveau']
-                st.session_state.quantity = match.iloc[0]['quantite']
-                st.session_state.scan_state = 'WAITING_NEW'
+        if code and code != st.session_state.last_processed_code:
+            success, message = process_scan(code, df)
+            if success:
+                st.success(message)
+                st.balloons() if "SUCCÈS" in message else None
                 st.rerun()
             else:
-                st.error(f"❌ Code non trouvé : {cleaned}")
+                st.error(message)
+        elif not code:
+            st.warning("Aucun code détecté. Réessayez avec une photo plus nette.")
+
+with tab2:
+    # Input manuel
+    with st.form("manual_form", clear_on_submit=True):
+        code_input = st.text_input("Code-barres", placeholder="Ex: A-01-01-1")
+        submit = st.form_submit_button("✅ Valider", use_container_width=True, type="primary")
         
-        elif st.session_state.scan_state == 'WAITING_NEW':
-            # Vérifier nouveau
-            expected = clean_code(st.session_state.new_location)
-            if cleaned == expected:
-                st.session_state.processed += 1
-                st.success(f"✅ **SUCCÈS!** {st.session_state.quantity} pièces déplacées")
-                st.balloons()
-                # Reset
-                st.session_state.scan_state = 'WAITING_OLD'
-                st.session_state.old_location = None
-                st.session_state.new_location = None
-                st.session_state.quantity = None
+        if submit and code_input:
+            success, message = process_scan(code_input, df)
+            if success:
+                st.success(message)
+                st.balloons() if "SUCCÈS" in message else None
                 st.rerun()
             else:
-                st.error(f"❌ Mauvais emplacement! Attendu: {st.session_state.new_location}")
+                st.error(message)
+
+with tab3:
+    st.info("Pour scanner USB/Bluetooth")
+    
+    # Input pour scanner qui émule clavier (sans limite de caractères)
+    usb_code = st.text_input(
+        "Le scanner enverra le code ici",
+        placeholder="Attendez le scan...",
+        key="usb_scanner"
+    )
+    
+    if usb_code:
+        success, message = process_scan(usb_code, df)
+        if success:
+            st.success(message)
+            st.balloons() if "SUCCÈS" in message else None
+            # Clear et rerun
+            st.session_state.usb_scanner = ""
+            st.rerun()
+        else:
+            st.error(message)
 
 # Infos actuelles
 if st.session_state.old_location:
@@ -229,21 +235,5 @@ if st.button("🔄 RESET", use_container_width=True):
     st.session_state.old_location = None
     st.session_state.new_location = None
     st.session_state.quantity = None
+    st.session_state.last_processed_code = None
     st.rerun()
-
-# Script pour recevoir messages du scanner HTML
-st.components.v1.html("""
-<script>
-window.addEventListener('message', function(e) {
-    if (e.data.type === 'BARCODE_SCAN') {
-        // Simuler un submit du formulaire avec le code scanné
-        const input = window.parent.document.querySelector('input[type="text"]');
-        const button = window.parent.document.querySelector('button[type="submit"]');
-        if (input && button) {
-            input.value = e.data.code;
-            button.click();
-        }
-    }
-});
-</script>
-""", height=0)
