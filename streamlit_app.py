@@ -3,10 +3,7 @@ import pandas as pd
 import re
 from datetime import datetime
 import time
-import cv2
-import numpy as np
-from pyzbar import pyzbar
-from PIL import Image
+import base64
 
 # Configuration de la page pour mobile
 st.set_page_config(
@@ -49,16 +46,106 @@ st.markdown("""
     .waiting { background-color: #2196F3; color: white; }
     .direction { background-color: #FF9800; color: white; }
     
-    /* Cache le menu Streamlit */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    
-    /* Force la caméra arrière sur mobile */
-    video {
-        facingMode: environment;
-    }
     </style>
     """, unsafe_allow_html=True)
+
+# JavaScript pour scanner en continu
+SCANNER_HTML = """
+<div id="scanner-container" style="position: relative; width: 100%; max-width: 500px; margin: auto;">
+    <video id="video" style="width: 100%; height: auto;"></video>
+    <canvas id="canvas" style="display: none;"></canvas>
+    <div id="result" style="margin-top: 20px; padding: 10px; background: #f0f0f0; border-radius: 5px; min-height: 50px;"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/quagga@0.12.1/dist/quagga.min.js"></script>
+
+<script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const resultDiv = document.getElementById('result');
+    let scanning = true;
+    
+    // Accéder à la caméra arrière
+    navigator.mediaDevices.getUserMedia({ 
+        video: { 
+            facingMode: 'environment',
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+        } 
+    })
+    .then(function(stream) {
+        video.srcObject = stream;
+        video.play();
+        requestAnimationFrame(scan);
+    })
+    .catch(function(err) {
+        console.error('Erreur caméra:', err);
+        resultDiv.innerHTML = 'Erreur: Impossible d\'accéder à la caméra';
+    });
+    
+    function scan() {
+        if (video.readyState === video.HAVE_ENOUGH_DATA && scanning) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            
+            // Essayer de détecter un QR code
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+                inversionAttempts: "dontInvert"
+            });
+            
+            if (code) {
+                scanning = false;
+                resultDiv.innerHTML = 'Code détecté: ' + code.data;
+                
+                // Envoyer le résultat à Streamlit
+                window.parent.postMessage({
+                    type: 'barcode_detected',
+                    data: code.data
+                }, '*');
+                
+                // Recommencer le scan après 2 secondes
+                setTimeout(() => {
+                    scanning = true;
+                    resultDiv.innerHTML = 'Recherche...';
+                }, 2000);
+            } else {
+                // Essayer avec Quagga pour les codes-barres 1D
+                Quagga.decodeSingle({
+                    decoder: {
+                        readers: ["ean_reader", "ean_8_reader", "code_128_reader", "code_39_reader"]
+                    },
+                    locate: true,
+                    src: canvas.toDataURL()
+                }, function(result) {
+                    if(result && result.codeResult) {
+                        scanning = false;
+                        resultDiv.innerHTML = 'Code détecté: ' + result.codeResult.code;
+                        
+                        // Envoyer le résultat à Streamlit
+                        window.parent.postMessage({
+                            type: 'barcode_detected',
+                            data: result.codeResult.code
+                        }, '*');
+                        
+                        setTimeout(() => {
+                            scanning = true;
+                            resultDiv.innerHTML = 'Recherche...';
+                        }, 2000);
+                    }
+                });
+            }
+        }
+        requestAnimationFrame(scan);
+    }
+</script>
+"""
 
 # Initialisation session state
 if 'state' not in st.session_state:
@@ -95,46 +182,10 @@ def load_csv():
     except Exception as e:
         st.error(f"Erreur CSV: {e}")
         return pd.DataFrame({
-            'ancien': ['TEST001', 'TEST002', 'TEST003'],
-            'quantite': [10, 25, 5],
-            'nouveau': ['A-01-01', 'A-01-02', 'B-01-01']
+            'ancien': ['TEST001', 'TEST002'],
+            'quantite': [10, 25],
+            'nouveau': ['A-01-01', 'A-01-02']
         })
-
-# Fonction pour scanner un code-barres depuis une image
-def scan_barcode_from_image(image):
-    try:
-        # Convertir l'image PIL en array numpy
-        img_array = np.array(image)
-        
-        # Convertir en BGR pour OpenCV
-        if len(img_array.shape) == 3:
-            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        else:
-            img_bgr = img_array
-        
-        # Détecter les codes-barres
-        barcodes = pyzbar.decode(img_bgr)
-        
-        if barcodes:
-            # Retourner le premier code trouvé
-            return barcodes[0].data.decode('utf-8')
-        
-        # Si pas de code trouvé avec l'image originale, essayer avec des améliorations
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        
-        # Améliorer le contraste
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        
-        # Réessayer avec l'image améliorée
-        barcodes = pyzbar.decode(enhanced)
-        if barcodes:
-            return barcodes[0].data.decode('utf-8')
-            
-        return None
-    except Exception as e:
-        st.error(f"Erreur scan: {e}")
-        return None
 
 # Fonction pour nettoyer les codes
 def clean_code(code):
@@ -180,31 +231,19 @@ elif st.session_state.state == 'WAITING_NEW':
 st.markdown("---")
 
 # Zone de scan
-tab1, tab2 = st.tabs(["📷 Scanner Caméra", "⌨️ Saisie Manuelle"])
+tab1, tab2 = st.tabs(["📷 Scanner Auto", "⌨️ Saisie Manuelle"])
 
 with tab1:
-    # Utiliser camera_input qui fonctionne mieux sur mobile
-    photo = st.camera_input(
-        "Prenez une photo du code-barres",
-        key=f"camera_{st.session_state.state}",
-        help="Assurez-vous que le code-barres est bien visible et net"
-    )
+    # Scanner JavaScript en continu
+    st.components.v1.html(SCANNER_HTML, height=600)
     
-    if photo is not None:
-        # Convertir en image PIL
-        image = Image.open(photo)
-        
-        # Scanner le code-barres
-        with st.spinner("Analyse du code-barres..."):
-            barcode_data = scan_barcode_from_image(image)
-        
-        if barcode_data:
-            st.success(f"Code détecté: {barcode_data}")
-            st.session_state.last_scan = barcode_data
-            time.sleep(1)
+    # Champ caché pour recevoir le résultat du JavaScript
+    result_container = st.container()
+    with result_container:
+        scan_result = st.text_input("Résultat du scan", key="scan_result", label_visibility="collapsed")
+        if scan_result:
+            st.session_state.last_scan = scan_result
             st.rerun()
-        else:
-            st.error("Aucun code-barres détecté. Réessayez ou utilisez la saisie manuelle.")
 
 with tab2:
     manual_input = st.text_input(
@@ -214,17 +253,9 @@ with tab2:
         key="manual_input"
     )
     
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("✅ VALIDER", type="primary", use_container_width=True):
-            if manual_input:
-                st.session_state.last_scan = manual_input
-                st.rerun()
-    
-    with col2:
-        # Bouton pour effacer
-        if st.button("🗑️ EFFACER", type="secondary", use_container_width=True):
-            st.session_state.last_scan = ""
+    if st.button("✅ VALIDER", type="primary", use_container_width=True):
+        if manual_input:
+            st.session_state.last_scan = manual_input
             st.rerun()
 
 # Traitement du scan
@@ -241,13 +272,6 @@ if st.session_state.last_scan:
             st.session_state.quantity = match.iloc[0]['quantite']
             st.session_state.state = 'WAITING_NEW'
             st.session_state.last_scan = ""
-            
-            # Son de succès (marche sur mobile)
-            st.markdown("""
-                <audio autoplay>
-                    <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBTGH0fPTgjMGHm7A7+OZURE..." type="audio/wav">
-                </audio>
-            """, unsafe_allow_html=True)
             
             st.success(f"✅ Trouvé! Direction: {st.session_state.new_location}")
             time.sleep(2)
@@ -280,17 +304,7 @@ if st.session_state.last_scan:
             st.rerun()
         else:
             st.error(f"❌ Mauvais emplacement!")
-            st.warning(f"Attendu: {st.session_state.new_location}")
             st.session_state.last_scan = ""
-
-# Informations actuelles
-if st.session_state.old_location:
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.info(f"📍 Ancien: **{st.session_state.old_location}**")
-    with col2:
-        st.info(f"📦 Nouveau: **{st.session_state.new_location or '-'}**")
 
 # Boutons d'action
 st.markdown("---")
@@ -301,8 +315,3 @@ if st.button("🔄 RESET", type="secondary", use_container_width=True):
     st.session_state.quantity = None
     st.session_state.last_scan = ""
     st.rerun()
-
-with st.expander(f"📜 Historique ({len(st.session_state.history)})"):
-    if st.session_state.history:
-        for item in reversed(st.session_state.history[-5:]):
-            st.text(f"{item['heure']} | {item['ancien']} → {item['nouveau']} ({item['quantite']})")
