@@ -1,7 +1,2 @@
 streamlit
-streamlit-camera-input-live
 pandas
-opencv-python-headless
-pyzbar
-pillow
-numpy
