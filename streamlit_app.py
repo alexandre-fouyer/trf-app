@@ -7,8 +7,6 @@ import cv2
 import numpy as np
 from pyzbar import pyzbar
 from PIL import Image
-import streamlit_webrtc as webrtc
-import av
 
 # Configuration de la page pour mobile
 st.set_page_config(
@@ -54,6 +52,11 @@ st.markdown("""
     /* Cache le menu Streamlit */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+    
+    /* Force la caméra arrière sur mobile */
+    video {
+        facingMode: environment;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -66,7 +69,6 @@ if 'state' not in st.session_state:
     st.session_state.processed = 0
     st.session_state.history = []
     st.session_state.last_scan = ""
-    st.session_state.scan_detected = False
 
 # Charger le CSV
 @st.cache_data
@@ -78,7 +80,6 @@ def load_csv():
             df = df.iloc[:, :3]
             df.columns = ['ancien', 'quantite', 'nouveau']
         else:
-            st.error("Format CSV incorrect")
             return pd.DataFrame()
         
         df['ancien'] = df['ancien'].astype(str).str.strip()
@@ -89,54 +90,51 @@ def load_csv():
         df = df[df['ancien'].str.len() > 0]
         df = df[~df['ancien'].str.contains('ancien', case=False, na=False)]
         
-        st.success(f"✅ CSV chargé: {len(df)} emplacements")
         return df
         
     except Exception as e:
-        st.error(f"Erreur chargement CSV: {e}")
+        st.error(f"Erreur CSV: {e}")
         return pd.DataFrame({
             'ancien': ['TEST001', 'TEST002', 'TEST003'],
             'quantite': [10, 25, 5],
             'nouveau': ['A-01-01', 'A-01-02', 'B-01-01']
         })
 
-# Classe pour traiter les frames vidéo
-class VideoProcessor:
-    def __init__(self):
-        self.result = None
+# Fonction pour scanner un code-barres depuis une image
+def scan_barcode_from_image(image):
+    try:
+        # Convertir l'image PIL en array numpy
+        img_array = np.array(image)
         
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
+        # Convertir en BGR pour OpenCV
+        if len(img_array.shape) == 3:
+            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        else:
+            img_bgr = img_array
         
         # Détecter les codes-barres
-        barcodes = pyzbar.decode(img)
+        barcodes = pyzbar.decode(img_bgr)
         
-        for barcode in barcodes:
-            # Décoder les données
-            barcode_data = barcode.data.decode('utf-8')
-            
-            # Dessiner un rectangle autour du code-barres détecté
-            points = barcode.polygon
-            if len(points) > 4:
-                hull = cv2.convexHull(np.array([point for point in points], dtype=np.float32))
-                points = hull
-            
-            n = len(points)
-            for j in range(0, n):
-                cv2.line(img, tuple(points[j]), tuple(points[(j+1) % n]), (0, 255, 0), 3)
-            
-            # Afficher le texte
-            x = barcode.rect[0]
-            y = barcode.rect[1]
-            cv2.putText(img, barcode_data, (x, y - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            # Stocker le résultat
-            if barcode_data and not st.session_state.scan_detected:
-                st.session_state.last_scan = barcode_data
-                st.session_state.scan_detected = True
+        if barcodes:
+            # Retourner le premier code trouvé
+            return barcodes[0].data.decode('utf-8')
         
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+        # Si pas de code trouvé avec l'image originale, essayer avec des améliorations
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Améliorer le contraste
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        
+        # Réessayer avec l'image améliorée
+        barcodes = pyzbar.decode(enhanced)
+        if barcodes:
+            return barcodes[0].data.decode('utf-8')
+            
+        return None
+    except Exception as e:
+        st.error(f"Erreur scan: {e}")
+        return None
 
 # Fonction pour nettoyer les codes
 def clean_code(code):
@@ -185,21 +183,28 @@ st.markdown("---")
 tab1, tab2 = st.tabs(["📷 Scanner Caméra", "⌨️ Saisie Manuelle"])
 
 with tab1:
-    # Scanner en temps réel avec webrtc
-    ctx = webrtc.webrtc_streamer(
-        key="barcode-scanner",
-        video_processor_factory=VideoProcessor,
-        rtc_configuration={
-            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-        },
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True
+    # Utiliser camera_input qui fonctionne mieux sur mobile
+    photo = st.camera_input(
+        "Prenez une photo du code-barres",
+        key=f"camera_{st.session_state.state}",
+        help="Assurez-vous que le code-barres est bien visible et net"
     )
     
-    # Si un code a été détecté
-    if st.session_state.scan_detected:
-        st.session_state.scan_detected = False
-        st.rerun()
+    if photo is not None:
+        # Convertir en image PIL
+        image = Image.open(photo)
+        
+        # Scanner le code-barres
+        with st.spinner("Analyse du code-barres..."):
+            barcode_data = scan_barcode_from_image(image)
+        
+        if barcode_data:
+            st.success(f"Code détecté: {barcode_data}")
+            st.session_state.last_scan = barcode_data
+            time.sleep(1)
+            st.rerun()
+        else:
+            st.error("Aucun code-barres détecté. Réessayez ou utilisez la saisie manuelle.")
 
 with tab2:
     manual_input = st.text_input(
@@ -209,9 +214,17 @@ with tab2:
         key="manual_input"
     )
     
-    if st.button("✅ VALIDER", type="primary", use_container_width=True):
-        if manual_input:
-            st.session_state.last_scan = manual_input
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✅ VALIDER", type="primary", use_container_width=True):
+            if manual_input:
+                st.session_state.last_scan = manual_input
+                st.rerun()
+    
+    with col2:
+        # Bouton pour effacer
+        if st.button("🗑️ EFFACER", type="secondary", use_container_width=True):
+            st.session_state.last_scan = ""
             st.rerun()
 
 # Traitement du scan
@@ -229,8 +242,15 @@ if st.session_state.last_scan:
             st.session_state.state = 'WAITING_NEW'
             st.session_state.last_scan = ""
             
+            # Son de succès (marche sur mobile)
+            st.markdown("""
+                <audio autoplay>
+                    <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBTGH0fPTgjMGHm7A7+OZURE..." type="audio/wav">
+                </audio>
+            """, unsafe_allow_html=True)
+            
             st.success(f"✅ Trouvé! Direction: {st.session_state.new_location}")
-            time.sleep(1)
+            time.sleep(2)
             st.rerun()
         else:
             st.error(f"❌ Code non trouvé: {scan_clean}")
@@ -285,4 +305,4 @@ if st.button("🔄 RESET", type="secondary", use_container_width=True):
 with st.expander(f"📜 Historique ({len(st.session_state.history)})"):
     if st.session_state.history:
         for item in reversed(st.session_state.history[-5:]):
-            st.text(f"{item['heure']} | {item['ancien']} → {item['nouveau']}")
+            st.text(f"{item['heure']} | {item['ancien']} → {item['nouveau']} ({item['quantite']})")
