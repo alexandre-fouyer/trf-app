@@ -2,9 +2,6 @@ import streamlit as st
 import pandas as pd
 import re
 from datetime import datetime
-import cv2
-import numpy as np
-from pyzbar import pyzbar
 import time
 
 # Configuration de la page pour mobile
@@ -69,18 +66,32 @@ if 'state' not in st.session_state:
 @st.cache_data
 def load_csv():
     try:
-        # Charger depuis le fichier dans le repo
-        df = pd.read_csv('emplacements.csv', sep=';', header=None, names=['ancien', 'quantite', 'nouveau'])
+        # Lire le CSV avec le bon séparateur (point-virgule)
+        df = pd.read_csv('emplacements.csv', sep=';', header=None, encoding='utf-8')
         
-        # Nettoyer les données
-        df['ancien'] = df['ancien'].str.strip()
-        df['nouveau'] = df['nouveau'].str.strip()
+        # Si le CSV a 4 colonnes (avec le ; à la fin), on prend les 3 premières
+        if len(df.columns) >= 3:
+            df = df.iloc[:, :3]  # Garder seulement les 3 premières colonnes
+            df.columns = ['ancien', 'quantite', 'nouveau']
+        else:
+            st.error("Format CSV incorrect")
+            return pd.DataFrame()
+        
+        # Convertir en string d'abord pour éviter l'erreur
+        df['ancien'] = df['ancien'].astype(str).str.strip()
+        df['nouveau'] = df['nouveau'].astype(str).str.strip()
+        
+        # Convertir la quantité en nombre
         df['quantite'] = pd.to_numeric(df['quantite'], errors='coerce').fillna(0).astype(int)
         
-        # Enlever les lignes avec header si présentes
+        # Enlever les lignes avec header ou invalides
+        df = df[df['ancien'] != '1']  # Enlever la ligne header "1;2;3"
+        df = df[df['ancien'].str.len() > 0]  # Enlever les lignes vides
         df = df[~df['ancien'].str.contains('ancien', case=False, na=False)]
         
+        st.success(f"✅ CSV chargé: {len(df)} emplacements")
         return df
+        
     except Exception as e:
         st.error(f"Erreur chargement CSV: {e}")
         # Données de test si erreur
@@ -90,38 +101,25 @@ def load_csv():
             'nouveau': ['A-01-01', 'A-01-02', 'B-01-01']
         })
 
-# Fonction pour scanner avec la caméra
-def scan_barcode_camera():
-    """Scanner de code-barres utilisant la caméra"""
-    camera_placeholder = st.empty()
-    
-    # Utiliser camera_input de Streamlit (méthode simple)
-    img_file = camera_placeholder.camera_input("Pointez vers le code-barres", key="camera")
+# Fonction pour scanner avec la caméra (simplifiée sans pyzbar pour l'instant)
+def camera_scan_section():
+    """Section pour scanner avec la caméra"""
+    img_file = st.camera_input("Pointez vers le code-barres")
     
     if img_file is not None:
-        # Lire l'image
-        bytes_data = img_file.getvalue()
-        nparr = np.frombuffer(bytes_data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Détecter les codes-barres
-        barcodes = pyzbar.decode(img)
-        
-        if barcodes:
-            # Prendre le premier code détecté
-            barcode_data = barcodes[0].data.decode('utf-8')
-            camera_placeholder.empty()  # Fermer la caméra
-            return barcode_data
+        st.info("Photo prise! Utilisez la saisie manuelle pour l'instant.")
+        # Note: Pour activer le vrai scan, il faudra installer pyzbar
+        # et opencv-python sur le serveur Streamlit
     
     return None
 
 # Fonction pour nettoyer les codes
 def clean_code(code):
-    if code and not any(x in code for x in ['POUMON', 'DELTA', 'DEMENAGEMENT']):
+    if code and not any(x in str(code).upper() for x in ['POUMON', 'DELTA', 'DEMENAGEMENT']):
         pattern = r'^([A-Z])\1(-\d)'
-        if re.match(pattern, code):
-            return re.sub(pattern, r'\1\2', code)
-    return code
+        if re.match(pattern, str(code)):
+            return re.sub(pattern, r'\1\2', str(code))
+    return str(code)
 
 # Charger les données
 df = load_csv()
@@ -159,32 +157,14 @@ elif st.session_state.state == 'WAITING_NEW':
 st.markdown("---")
 
 # Zone de scan
-tab1, tab2 = st.tabs(["📷 Scanner Caméra", "⌨️ Saisie Manuelle"])
+tab1, tab2 = st.tabs(["⌨️ Saisie Manuelle", "📷 Scanner Caméra"])
 
 with tab1:
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        if st.button("🎯 ACTIVER SCANNER", type="primary", use_container_width=True):
-            st.session_state.camera_active = True
-    
-    with col2:
-        if st.button("❌ FERMER", type="secondary", use_container_width=True):
-            st.session_state.camera_active = False
-            st.rerun()
-    
-    if st.session_state.camera_active:
-        scanned_code = scan_barcode_camera()
-        if scanned_code:
-            st.session_state.camera_active = False
-            st.session_state.last_scan = scanned_code
-            st.rerun()
-
-with tab2:
     manual_input = st.text_input(
         "Code-barres",
-        placeholder="Entrez le code manuellement...",
-        label_visibility="collapsed"
+        placeholder="Entrez le code ou scannez...",
+        label_visibility="collapsed",
+        key="manual_input"
     )
     
     if st.button("✅ VALIDER", type="primary", use_container_width=True):
@@ -192,13 +172,18 @@ with tab2:
             st.session_state.last_scan = manual_input
             st.rerun()
 
+with tab2:
+    st.info("Scanner caméra en développement. Utilisez la saisie manuelle pour l'instant.")
+    camera_scan_section()
+
 # Traitement du scan
 if st.session_state.last_scan:
     scan_clean = clean_code(st.session_state.last_scan.strip().upper())
     
     if st.session_state.state == 'WAITING_OLD':
         # Chercher dans le CSV
-        match = df[df['ancien'].str.upper() == scan_clean]
+        df['ancien_upper'] = df['ancien'].str.upper()
+        match = df[df['ancien_upper'] == scan_clean]
         
         if not match.empty:
             st.session_state.old_location = scan_clean
@@ -215,7 +200,9 @@ if st.session_state.last_scan:
             st.session_state.last_scan = ""
     
     elif st.session_state.state == 'WAITING_NEW':
-        if scan_clean == st.session_state.new_location.upper():
+        new_location_clean = clean_code(st.session_state.new_location.strip().upper())
+        
+        if scan_clean == new_location_clean:
             st.session_state.processed += 1
             st.session_state.history.append({
                 'ancien': st.session_state.old_location,
@@ -267,3 +254,10 @@ with col2:
         if st.session_state.history:
             for item in reversed(st.session_state.history[-5:]):
                 st.text(f"{item['heure']} | {item['ancien']} → {item['nouveau']}")
+
+# Debug - Afficher quelques lignes du CSV
+with st.expander("🔍 Debug - Voir les données"):
+    if not df.empty:
+        st.write(f"Nombre total d'emplacements: {len(df)}")
+        st.write("Premiers emplacements:")
+        st.dataframe(df.head(10))
